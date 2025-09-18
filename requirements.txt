@@ -6,4 +6,3 @@ pydantic
 python-dotenv
 pandas
 openpyxl
-bson
