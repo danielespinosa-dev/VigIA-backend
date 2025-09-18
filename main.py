@@ -2,7 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from models import MsgPayload
 from routers.vigia import router as vigia_router
-
+from dotenv import load_dotenv
+load_dotenv()
 app = FastAPI()
 
 # Habilitar CORS para todos los orígenes (puedes personalizar los parámetros)
