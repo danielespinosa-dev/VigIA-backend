@@ -134,6 +134,8 @@ async def procesar_solicitud_con_assistant(
         await assistant.depureFiles()
         # analisis =await assistant.analizar_solicitud_completions(solicitud)
         # solicitud.Analisis=analisis
+        solicitud.FechaFinalizacion = datetime.utcnow()
+        solicitud.EstadoGeneral = "completado"
         await db.Solicitud.update_one({"SolicitudID": solicitud.SolicitudID}, {"$set": solicitud.dict()})
     
     print(f"[Vigia] Solicitud {solicitud.SolicitudID} actualizada tras evaluación {tipo_asistente.value}")
@@ -178,13 +180,14 @@ async def create_solicitud(
         ProveedorNombre=ProveedorNombre,
         ProveedorNIT=ProveedorNIT,
         FechaCreacion=datetime.utcnow(),
-        EstadoGeneral=EstadoGeneral,
+        EstadoGeneral="En progreso",
         UsuarioSolicitante=UsuarioSolicitante,
         FuenteExcelPath=excel_file.filename,
         Anexos=anexos_ids,
         Estado={"economica": "pending", "social": "pending", "ambiental": "pending"},
         Cuestionario=cuestionario_csv
     )
+
     await db.Solicitud.insert_one(solicitud.dict())
     print(f"[Vigia] Solicitud creada con ID: {solicitud.SolicitudID}")
 

@@ -41,31 +41,49 @@ class OpenAIAssistant:
     async def create_message_with_files(self, thread_id: str, content: str, file_ids: Optional[List[str]]) -> Optional[str]:
         """
         Crea un mensaje en el hilo del asistente incluyendo archivos adjuntos.
+        Si hay más de 5 archivos, los envía en lotes de 5 por mensaje.
         Captura y loguea cualquier excepción, devolviendo None en caso de error.
         """
         try:
-            attachments = []
-            if file_ids:
-                for fid in file_ids:
-                    attachments.append({
+            if not file_ids:
+                # Si no hay archivos, solo envía el mensaje normal
+                return await self.create_message(thread_id, content)
+            message_ids = []
+            # Procesar archivos en lotes de 5
+            for i in range(0, len(file_ids), 5):
+                batch = file_ids[i:i+5]
+                attachments = [
+                    {
                         "file_id": fid,
-                        "tools": [{"type": "code_interpreter"}]
-                    })
-            message_payload = {
-                "role": "user",
-                "content": content,
-                "attachments": attachments
-            }
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{self.base_url}/threads/{thread_id}/messages",
-                    headers=self.headers,
-                    json=message_payload
-                )
-                response.raise_for_status()
-                message_id = response.json()["id"]
-                print(f"[OpenAI] Mensaje con archivos creado en thread {thread_id}: {message_id}")
-                return message_id
+                        "tools": [
+                            {"type": "file_search"},
+                            {"type": "code_interpreter"}
+                        ]
+                    }
+                    for fid in batch
+                ]
+                message_payload = {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"{content} (Archivos {i+1}-{i+len(batch)})"
+                        }
+                    ],
+                    "attachments": attachments
+                }
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{self.base_url}/threads/{thread_id}/messages",
+                        headers=self.headers,
+                        json=message_payload
+                    )
+                    response.raise_for_status()
+                    message_id = response.json()["id"]
+                    print(f"[OpenAI] Mensaje con archivos creado en thread {thread_id}: {message_id} (Archivos {i+1}-{i+len(batch)})")
+                    message_ids.append(message_id)
+            # Retorna el último message_id (o lista si prefieres)
+            return message_ids[-1] if message_ids else None
         except Exception as e:
             print(f"[OpenAI][ERROR] create_message_with_files Unexpected error: {str(e)}")
             return None
@@ -82,14 +100,28 @@ class OpenAIAssistant:
             print(f"[OpenAI] Run creado en thread {thread_id}: {run_id}")
             return run_id
 
-    async def get_run_status(self, thread_id: str, run_id: str) -> Dict[str, Any]:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.base_url}/threads/{thread_id}/runs/{run_id}",
-                headers=self.headers
-            )
-            response.raise_for_status()
-            return response.json()
+    async def get_run_status(self, thread_id: str, run_id: str, max_retries: int = 10, retry_interval: float = 2.0) -> Dict[str, Any]:
+        """
+        Consulta el estado de un run en OpenAI. Si la petición falla, reintenta hasta max_retries veces.
+        """
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        f"{self.base_url}/threads/{thread_id}/runs/{run_id}",
+                        headers=self.headers
+                    )
+                    response.raise_for_status()
+                    return response.json()
+            except httpx.HTTPStatusError as e:
+                print(f"[OpenAI][ERROR] get_run_status intento {attempt+1}: {e.response.status_code} - {e.response.text}")
+            except Exception as e:
+                print(f"[OpenAI][ERROR] get_run_status intento {attempt+1}: {str(e)}")
+            attempt += 1
+            await asyncio.sleep(retry_interval)
+        print(f"[OpenAI][ERROR] get_run_status falló tras {max_retries} intentos para run {run_id}")
+        return {}
 
     async def wait_for_required_action(
         self,
@@ -105,6 +137,7 @@ class OpenAIAssistant:
         while elapsed < timeout:
             run_status = await self.get_run_status(thread_id, run_id)
             status = run_status.get("status")
+            print(f"[OpenAI] status ({tipo_asistente.value}) {status}")
             if status == "requires_action" and run_status.get("required_action"):
                 required_action_detected = True
                 required_action = run_status["required_action"]
@@ -144,45 +177,57 @@ class OpenAIAssistant:
                     "required_action": required_action_response,
                     "assistant_response": assistant_response
                 }
-            if status in ["failed", "cancelled"]:
-                print(f"[OpenAI] Run {run_id} fallido o cancelado ({status})")
+            if status in ["cancelling","failed", "cancelled","incomplete","expired"]:
+                print(f"[OpenAI] Run {run_id} estado ({status})")
                 return {
                     "required_action": required_action_response,
                     "assistant_response": status
                 }
             await asyncio.sleep(interval)
             elapsed += interval
+        
         print(f"[OpenAI] wait_for_required_action Timeout esperando required_action o completion en run {run_id}")
         raise TimeoutError("wait_for_required_action Run did not reach required_action or completed state in time.")
 
-    async def get_completed_run_response(self, thread_id: str, run_id: str) -> Optional[str]:
+    async def get_completed_run_response(self, thread_id: str, run_id: str, max_retries: int = 5, retry_interval: float = 2.0) -> Optional[str]:
         """
         Consulta la respuesta del asistente cuando el run está completado.
-        Retorna el contenido de texto del último mensaje del asistente o None si no hay respuesta.
+        Retorna el contenido de texto de todos los mensajes del asistente, separados por salto de línea.
+        Si la petición falla, reintenta hasta max_retries veces.
         """
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.base_url}/threads/{thread_id}/messages",
-                headers=self.headers
-            )
-            response.raise_for_status()
-            messages = response.json().get("data", [])
-            for msg in reversed(messages):
-                if msg.get("role") == "assistant":
-                    content = msg.get("content")
-                    if isinstance(content, list):
-                        texts = []
-                        for c in content:
-                            if c.get("type") == "text":
-                                text_obj = c.get("text")
-                                if isinstance(text_obj, dict):
-                                    texts.append(text_obj.get("value", ""))
-                                elif isinstance(text_obj, str):
-                                    texts.append(text_obj)
-                        return " ".join(texts)
-                    elif isinstance(content, str):
-                        return content
-            return None
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        f"{self.base_url}/threads/{thread_id}/messages",
+                        headers=self.headers
+                    )
+                    response.raise_for_status()
+                    messages = response.json().get("data", [])
+                    assistant_texts = []
+                    for msg in messages:
+                        if msg.get("role") == "assistant":
+                            content = msg.get("content")
+                            if isinstance(content, list):
+                                for c in content:
+                                    if c.get("type") == "text":
+                                        text_obj = c.get("text")
+                                        if isinstance(text_obj, dict):
+                                            assistant_texts.append(text_obj.get("value", ""))
+                                        elif isinstance(text_obj, str):
+                                            assistant_texts.append(text_obj)
+                            elif isinstance(content, str):
+                                assistant_texts.append(content)
+                    return "\n".join(assistant_texts) if assistant_texts else None
+            except httpx.HTTPStatusError as e:
+                print(f"[OpenAI][ERROR] get_completed_run_response intento {attempt+1}: {e.response.status_code} - {e.response.text}")
+            except Exception as e:
+                print(f"[OpenAI][ERROR] get_completed_run_response intento {attempt+1}: {str(e)}")
+            attempt += 1
+            await asyncio.sleep(retry_interval)
+        print(f"[OpenAI][ERROR] get_completed_run_response falló tras {max_retries} intentos para thread {thread_id}, run {run_id}")
+        return None
 
     async def run_assistant_flow(
         self,
