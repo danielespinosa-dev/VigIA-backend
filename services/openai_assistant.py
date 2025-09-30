@@ -1,3 +1,5 @@
+import io
+import pandas as pd
 from flask import json
 import httpx
 import asyncio
@@ -72,6 +74,7 @@ class OpenAIAssistant:
                     ],
                     "attachments": attachments
                 }
+                print("Payload enviado a OpenAI:", message_payload)
                 async with httpx.AsyncClient() as client:
                     response = await client.post(
                         f"{self.base_url}/threads/{thread_id}/messages",
@@ -281,6 +284,51 @@ class OpenAIAssistant:
         except Exception as e:
             print(f"[OpenAI][ERROR] {filename} Unexpected error al subir archivo: {str(e)}")
             return None
+        
+    # ...existing code...
+
+    async def upload_file_from_formdata_v2(self, file, filename: str, purpose: str = "assistants") -> Optional[Dict[str, Any]]:
+        """
+        Sube un archivo recibido como FormData (por ejemplo, desde FastAPI) al API de OpenAI.
+        Si el archivo es Excel, lo convierte a CSV antes de subirlo.
+        """
+        try:
+            file_bytes = await file.read()
+            # Detecta si es un archivo Excel por la extensión
+            if filename.lower().endswith(('.xlsx', '.xls')):
+                # Convierte el Excel a CSV
+                excel_io = io.BytesIO(file_bytes)
+                df = pd.read_excel(excel_io)
+                csv_buffer = io.StringIO()
+                df.to_csv(csv_buffer, index=False)
+                file_bytes = csv_buffer.getvalue().encode('utf-8')
+                filename = filename.rsplit('.', 1)[0] + ".txt"
+                mime_type = "text"
+            else:
+                mime_type = "application/octet-stream"
+            async with httpx.AsyncClient() as client:
+                files = {"file": (filename, file_bytes, mime_type)}
+                data = {"purpose": purpose}
+                response = await client.post(
+                    f"{self.base_url}/files",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "OpenAI-Beta": "assistants=v2"
+                    },
+                    data=data,
+                    files=files
+                )
+                response.raise_for_status()
+                file_id = response.json().get("id")
+                print(f"[OpenAI] Archivo subido: {file_id} ({filename})")
+                return response.json()
+        except httpx.HTTPStatusError as e:
+            print(f"[OpenAI][ERROR] Upload file:{filename} {e.response.status_code} - {e.response.text}")
+            return None
+        except Exception as e:
+            print(f"[OpenAI][ERROR] {filename} Unexpected error al subir archivo: {str(e)}")
+            return None
+# ...existing code...
         
     async def depureFiles(self):
         """
